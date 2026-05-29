@@ -41,8 +41,18 @@ jobs:
       - name: 7. Pull Vercel Environment
         run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
 
+      - name: 7.5 Debug Env (safe)
+        run: |
+          set -a && source .vercel/.env.production.local 2>/dev/null; set +a
+          echo "AUTH_SSO_PROVIDERS: $( [ -n "${AUTH_SSO_PROVIDERS:-}" ] && echo '<set>' || echo '<not set>' )"
+          echo "AUTH_CLOUDFLARE_ZERO_TRUST_ID: $( [ -n "${AUTH_CLOUDFLARE_ZERO_TRUST_ID:-}" ] && echo '<set>' || echo '<not set>' )"
+          echo "AUTH_CLOUDFLARE_ZERO_TRUST_SECRET: $( [ -n "${AUTH_CLOUDFLARE_ZERO_TRUST_SECRET:-}" ] && echo '<set>' || echo '<not set>' )"
+          echo "AUTH_CLOUDFLARE_ZERO_TRUST_ISSUER: $( [ -n "${AUTH_CLOUDFLARE_ZERO_TRUST_ISSUER:-}" ] && echo '<set>' || echo '<not set>' )"
+
       - name: 8. Build Project Artifacts
         run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
 
       - name: 9. Deploy to Vercel
         run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
