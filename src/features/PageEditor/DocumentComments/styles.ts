@@ -1,5 +1,5 @@
 import { DEFAULT_BLOCK_ANCHOR_PADDING } from '@lobehub/editor/react';
-import { createStaticStyles, cssVar } from 'antd-style';
+import { createStaticStyles, cssVar } from '@lobehub/ui';
 
 import { GUTTER_INSET_END, GUTTER_INSET_START } from './Gutter/constants';
 
@@ -158,8 +158,9 @@ export const styles = createStaticStyles(({ css }) => ({
   commentContent: css`
     /* Published comments render images as left-aligned thumbnails: the
        renderer inlines the stored (natural) width, which would otherwise span
-       the whole column. */
-    & figure:has(> img) {
+       the whole column. The zoomable image wraps its <img> in a couple of
+       layout boxes, hence the descendant (not child) match. */
+    & figure:has(img) {
       margin-block: 8px;
       text-align: start;
     }

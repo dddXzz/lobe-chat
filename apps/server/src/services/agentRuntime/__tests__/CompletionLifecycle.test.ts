@@ -1,11 +1,15 @@
 // @vitest-environment node
 import { type Message, parse } from '@lobechat/conversation-flow';
 import { ChatErrorType, RequestTrigger } from '@lobechat/types';
+import debug from 'debug';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { NotifyAgentInterventionRequiredParams } from '@/business/server/agent-run/agentInterventionReview';
+import { AgentOperationModel } from '@/database/models/agentOperation';
+import { WorkModel } from '@/database/models/work';
 import * as agentSignalService from '@/server/services/agentSignal';
 import * as verifyServices from '@/server/services/verify';
+import type * as WorkRegistrationModule from '@/server/services/workRegistration';
 import { registerWorksForOperation } from '@/server/services/workRegistration';
 
 import {
@@ -24,6 +28,7 @@ const {
   mockNotifyAgentInterventionRequired,
   mockNotifyAgentRunCompleted,
   mockListWorks,
+  mockSettleRunningOperation,
 } = vi.hoisted(() => ({
   mockBuildRuntimeInterventionNotification: vi.fn<
     () => Promise<NotifyAgentInterventionRequiredParams | undefined>
@@ -31,11 +36,22 @@ const {
   mockNotifyAgentInterventionRequired: vi.fn(async () => {}),
   mockNotifyAgentRunCompleted: vi.fn(async () => {}),
   mockListWorks: vi.fn(async (): Promise<{ id: string }[]> => []),
+  mockSettleRunningOperation: vi.fn(async () => ({ status: 'settled' as const })),
 }));
 
 vi.mock('@/database/models/work', () => ({
   WorkModel: vi.fn(function () {
     return { listByRootOperation: mockListWorks };
+  }),
+}));
+
+// `TopicModel.settleRunningOperation` is a class FIELD (bound per instance, not
+// on the prototype), so observing it means swapping the class. This is the only
+// TopicModel use in the lifecycle, and the tests below assert both that it runs
+// for a finished run and that it is deliberately skipped otherwise.
+vi.mock('@/database/models/topic', () => ({
+  TopicModel: vi.fn(function () {
+    return { settleRunningOperation: mockSettleRunningOperation };
   }),
 }));
 
@@ -51,13 +67,60 @@ vi.mock('../agentInterventionNotification', () => ({
   buildRuntimeInterventionNotification: mockBuildRuntimeInterventionNotification,
 }));
 
-vi.mock('@/server/services/workRegistration', () => ({
+vi.mock('@/server/services/workRegistration', async (importOriginal) => ({
+  // Keep the real scope resolver: it is pure, and the share-visitor test below
+  // asserts the scope it derives reaches both the scan and the anchor lookup.
+  ...(await importOriginal<typeof WorkRegistrationModule>()),
   registerWorksForOperation: vi.fn(),
 }));
 
 const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 const buildLifecycle = () => new CompletionLifecycle({} as any, 'user-1');
+
+describe('CompletionLifecycle.recordStart diagnostics', () => {
+  let debugNamespaces: string;
+
+  beforeEach(() => {
+    debugNamespaces = debug.disable();
+    debug.enable('lobe-server:completion-lifecycle');
+  });
+
+  afterEach(() => {
+    debug.enable(debugNamespaces);
+    vi.restoreAllMocks();
+  });
+
+  it.each([undefined, { _hooks: [] }])(
+    'retains the database failure cause without persisted hooks: %j',
+    async (metadata) => {
+      vi.spyOn(AgentOperationModel.prototype, 'recordStart').mockRejectedValue(
+        new Error('connection refused'),
+      );
+      const output = vi.spyOn(debug, 'log').mockImplementation(() => {});
+
+      expect(await buildLifecycle().recordStart({ operationId: 'op-1', metadata })).toBe(false);
+      expect(output.mock.calls.flat().join(' ')).toContain('connection refused');
+    },
+  );
+
+  it('does not log database parameters containing hook credentials', async () => {
+    const secret = 'synthetic-hook-authorization';
+    vi.spyOn(AgentOperationModel.prototype, 'recordStart').mockRejectedValue(
+      new Error(`Failed query; params: ${secret}`),
+    );
+    const output = vi.spyOn(debug, 'log').mockImplementation(() => {});
+
+    expect(
+      await buildLifecycle().recordStart({
+        operationId: 'op-1',
+        metadata: { _hooks: [{ webhook: { headers: { Authorization: secret } } }] },
+      }),
+    ).toBe(false);
+    expect(output.mock.calls.flat().join(' ')).toContain('Failed to record operation start');
+    expect(output.mock.calls.flat().join(' ')).not.toContain(secret);
+  });
+});
 
 describe('isSuccessLikeCompletionReason', () => {
   // Regression: file-Work registration was gated on `reason === 'done'` alone,
@@ -170,6 +233,78 @@ describe('CompletionLifecycle.extractErrorMessage', () => {
 describe('CompletionLifecycle.buildLifecycleEvent', () => {
   const callBuild = (state: unknown, reason = 'completed') =>
     (buildLifecycle() as any).buildLifecycleEvent('op-1', state, reason);
+
+  it('attaches Markdown images explicitly included in the final reply without changing its text', () => {
+    const url = 'https://cdn.example.com/f/file_image';
+    const content = `Here is the result: ![Result](${url})`;
+    const { event } = callBuild({ messages: [{ role: 'assistant', content }] });
+    expect(event.attachments).toEqual([{ fetchUrl: url, type: 'image' }]);
+    expect(event.lastAssistantContent).toBe(content);
+  });
+
+  it('preserves the order of distinct final-reply images', () => {
+    const { event } = callBuild({
+      messages: [
+        {
+          role: 'assistant',
+          content:
+            '![Before](https://cdn.example.com/before.png) ![After](https://cdn.example.com/after.png)',
+        },
+      ],
+    });
+    expect(event.attachments?.map((attachment: any) => attachment.fetchUrl)).toEqual([
+      'https://cdn.example.com/before.png',
+      'https://cdn.example.com/after.png',
+    ]);
+  });
+
+  it('parses reference images in final text parts and deduplicates structured images', () => {
+    const url = 'https://cdn.example.com/result.png';
+    const { event } = callBuild({
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: `![one][result] ![two](${url})\n\n[result]: ${url}` },
+            { type: 'image_url', image_url: { url } },
+          ],
+        },
+      ],
+    });
+    expect(event.attachments).toEqual([{ fetchUrl: url, type: 'image' }]);
+  });
+
+  it('does not promote tool state, tool Markdown, or an earlier reply to final attachments', () => {
+    const url = 'https://cdn.example.com/intermediate.png';
+    const { event } = callBuild({
+      messages: [
+        { role: 'assistant', content: `![earlier](${url})` },
+        { role: 'user', content: 'Analyze the result without sending an image.' },
+        { role: 'assistant', content: '', tools: [{ id: 'call-image' }] },
+        {
+          role: 'tool',
+          content: `![tool result](${url})`,
+          state: { generations: [{ asset: { url, type: 'image' } }] },
+        },
+        { role: 'assistant', content: 'The composition is balanced.' },
+      ],
+    });
+    expect(event.attachments).toBeUndefined();
+  });
+
+  it('does not treat ordinary links, code, escaped syntax or unsafe schemes as images', () => {
+    const content = [
+      'https://cdn.example.com/plain.png',
+      '[download](https://cdn.example.com/download.png)',
+      '`![inline](https://cdn.example.com/inline.png)`',
+      '```md\n![fenced](https://cdn.example.com/fenced.png)\n```',
+      '\\![escaped](https://cdn.example.com/escaped.png)',
+      '![unsafe](file:///tmp/image.png)',
+      '![unsafe](javascript:alert)',
+    ].join('\n\n');
+    const { event } = callBuild({ messages: [{ role: 'assistant', content }] });
+    expect(event.attachments).toBeUndefined();
+  });
 
   it('extracts text content from a plain-string final assistant turn', () => {
     const state = {
@@ -611,6 +746,44 @@ describe('CompletionLifecycle.dispatchHooks — error persistence', () => {
     });
   });
 
+  it("writes the error onto the run's own assistant row when a server run carries no assistantMessageId", async () => {
+    // A server `execAgent` turn leaves `metadata.assistantMessageId` unset; with
+    // no client online (a closed tab, a bot, a schedule) nothing else writes
+    // the error, so the reply row would stay an empty bubble.
+    const lifecycle = buildLifecycle();
+    const updateMessage = vi.fn().mockResolvedValue({ success: true });
+    const findLatestAssistantByOperationId = vi.fn().mockResolvedValue({ id: 'msg-run' });
+
+    (lifecycle as any).messageModel = { findLatestAssistantByOperationId, update: updateMessage };
+    vi.spyOn(lifecycle as any, 'persistCompletion').mockResolvedValue(undefined);
+    vi.spyOn(hookDispatcher, 'dispatch').mockResolvedValue(undefined as any);
+    vi.spyOn(hookDispatcher, 'unregister').mockImplementation(function () {});
+
+    await lifecycle.dispatchHooks(
+      'op-1',
+      {
+        error: {
+          error: { reason: 'claim_timeout', recoverable: true },
+          errorType: 'ClientLlmExecutorUnavailable',
+          provider: 'lmstudio',
+        },
+        host: { hooks: [] },
+        metadata: {},
+        origin: { topicId: 'tpc-1' },
+        status: 'error',
+      },
+      'error',
+    );
+
+    expect(findLatestAssistantByOperationId).toHaveBeenCalledWith({
+      operationId: 'op-1',
+      topicId: 'tpc-1',
+    });
+    expect(updateMessage).toHaveBeenCalledWith('msg-run', {
+      error: expect.objectContaining({ type: 'ClientLlmExecutorUnavailable' }),
+    });
+  });
+
   it('rethrows critical webhook failures after terminal persistence', async () => {
     const lifecycle = buildLifecycle();
     const persistCompletion = vi
@@ -643,6 +816,268 @@ describe('CompletionLifecycle.dispatchHooks — error persistence', () => {
     await lifecycle.dispatchHooks('op-reclaimed', { host: { hooks: [] }, status: 'done' }, 'done');
 
     expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  describe('a row the caller already retired as abandoned', () => {
+    // Mirrors `recordCompletion`'s guard: a row the stale-lease CAS moved to
+    // `abandoned` only accepts a write that keeps that status.
+    const retiredRowModel = () => ({
+      findById: vi.fn(async () => ({ id: 'op-stale', status: 'abandoned' })),
+      recordCompletion: vi.fn(async (_id: string, params: { status: string }) => {
+        return params.status === 'abandoned';
+      }),
+      sumChildUsage: vi.fn(async () => undefined),
+    });
+
+    it('persists onto the abandoned status and still fires the hooks', async () => {
+      const lifecycle = buildLifecycle();
+      const model = retiredRowModel();
+      (lifecycle as any).agentOperationModel = model;
+      const dispatch = vi.spyOn(hookDispatcher, 'dispatch').mockResolvedValue(undefined as any);
+      vi.spyOn(hookDispatcher, 'unregister').mockImplementation(function () {});
+
+      await lifecycle.dispatchHooks('op-stale', { host: { hooks: [] }, status: 'error' }, 'error', {
+        settledAsAbandoned: true,
+        skipErrorMessageWrite: true,
+      });
+
+      expect(model.recordCompletion).toHaveBeenCalledWith(
+        'op-stale',
+        expect.objectContaining({ completionReason: 'lease_expired', status: 'abandoned' }),
+      );
+      expect(dispatch).toHaveBeenCalled();
+    });
+
+    it('is refused as a conflicting owner without the flag, so no hooks fire', async () => {
+      const lifecycle = buildLifecycle();
+      (lifecycle as any).agentOperationModel = retiredRowModel();
+      const dispatch = vi.spyOn(hookDispatcher, 'dispatch').mockResolvedValue(undefined as any);
+      vi.spyOn(hookDispatcher, 'unregister').mockImplementation(function () {});
+
+      await lifecycle.dispatchHooks('op-stale', { host: { hooks: [] }, status: 'error' }, 'error', {
+        skipErrorMessageWrite: true,
+      });
+
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('CompletionLifecycle.dispatchHooks — the topic running mark', () => {
+  /**
+   * `recordCompletion` must land for the mark to be converged: the lifecycle
+   * treats an ending whose own row write failed as unproven, and a mark cleared
+   * on an unproven ending reads settled while `agent_operations` still says
+   * `running`.
+   */
+  const acceptingOperationModel = () => ({
+    findById: vi.fn(async () => null),
+    recordCompletion: vi.fn(async () => true),
+    sumChildUsage: vi.fn(async () => undefined),
+  });
+
+  const state = (overrides: Record<string, unknown> = {}) => ({
+    host: { hooks: [] },
+    messages: [{ content: 'final reply', role: 'assistant' }],
+    origin: { agentId: 'agt_1', topicId: 'tpc_1' },
+    status: 'interrupted',
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    mockSettleRunningOperation.mockReset().mockResolvedValue({ status: 'settled' });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('drops the mark when an interrupted run reaches its terminal row', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = acceptingOperationModel();
+
+    await lifecycle.dispatchHooks('op-1', state(), 'interrupted');
+
+    // A Stop is a visible ending the user already saw: `active`, the same status
+    // the client writes for an interrupted run.
+    expect(mockSettleRunningOperation).toHaveBeenCalledWith('tpc_1', 'op-1', 'active');
+  });
+
+  it('drops the mark for a clean finish, as unread', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = acceptingOperationModel();
+
+    await lifecycle.dispatchHooks('op-1', state({ status: 'done' }), 'done');
+
+    expect(mockSettleRunningOperation).toHaveBeenCalledWith('tpc_1', 'op-1', 'unread');
+  });
+
+  it('drops the mark for a run the step cap stopped, which never runs `finish`', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = acceptingOperationModel();
+
+    await lifecycle.dispatchHooks('op-1', state({ status: 'done' }), 'max_steps');
+
+    expect(mockSettleRunningOperation).toHaveBeenCalledWith('tpc_1', 'op-1', 'unread');
+  });
+
+  it.each(['waiting_for_async_tool', 'waiting_for_client', 'waiting_for_human'])(
+    'leaves the mark while the same operation is parked in %s',
+    async (reason) => {
+      const lifecycle = buildLifecycle();
+      (lifecycle as any).agentOperationModel = acceptingOperationModel();
+
+      await lifecycle.dispatchHooks('op-1', state({ status: reason }), reason);
+
+      expect(mockSettleRunningOperation).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does nothing for a run with no topic', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = acceptingOperationModel();
+
+    await lifecycle.dispatchHooks('op-1', state({ origin: { agentId: 'agt_1' } }), 'interrupted');
+
+    expect(mockSettleRunningOperation).not.toHaveBeenCalled();
+  });
+
+  it('leaves a lease-expired abandon to the path that settles it', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = {
+      findById: vi.fn(async () => ({ id: 'op-1', status: 'abandoned' })),
+      recordCompletion: vi.fn(
+        async (_id: string, params: { status: string }) => params.status === 'abandoned',
+      ),
+      sumChildUsage: vi.fn(async () => undefined),
+    };
+
+    await lifecycle.dispatchHooks('op-1', state({ status: 'error' }), 'error', {
+      settledAsAbandoned: true,
+      skipErrorMessageWrite: true,
+    });
+
+    // `AbandonOperationService` owns the topic there, with its own status.
+    expect(mockSettleRunningOperation).not.toHaveBeenCalled();
+  });
+
+  it('leaves the mark when the terminal row could not be written', async () => {
+    const lifecycle = buildLifecycle();
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    (lifecycle as any).agentOperationModel = {
+      findById: vi.fn(async () => null),
+      recordCompletion: vi.fn(async () => {
+        throw new Error('db is down');
+      }),
+      sumChildUsage: vi.fn(async () => undefined),
+    };
+
+    await lifecycle.dispatchHooks('op-1', state(), 'interrupted');
+
+    // The operation's own end is unproven, so the topic must keep saying so.
+    expect(mockSettleRunningOperation).not.toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
+
+  it('leaves the mark when no durable row exists to prove the ending', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = {
+      findById: vi.fn(async () => null),
+      recordCompletion: vi.fn(async () => false),
+      sumChildUsage: vi.fn(async () => undefined),
+    };
+
+    await lifecycle.dispatchHooks('op-1', state(), 'interrupted');
+
+    expect(mockSettleRunningOperation).not.toHaveBeenCalled();
+  });
+
+  it('still converges when another owner already wrote the terminal row', async () => {
+    const lifecycle = buildLifecycle();
+    const dispatch = vi.spyOn(hookDispatcher, 'dispatch').mockResolvedValue(undefined as any);
+    vi.spyOn(hookDispatcher, 'unregister').mockImplementation(function () {});
+    (lifecycle as any).agentOperationModel = {
+      findById: vi.fn(async () => ({ id: 'op-1', status: 'interrupted' })),
+      recordCompletion: vi.fn(async () => false),
+      sumChildUsage: vi.fn(async () => undefined),
+    };
+
+    await lifecycle.dispatchHooks('op-1', state(), 'interrupted');
+
+    // The run is over — someone else just recorded it — and hooks still stay
+    // parked with that owner.
+    expect(mockSettleRunningOperation).toHaveBeenCalledWith('tpc_1', 'op-1', 'active');
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Two terminal callbacks can race for the same operation: `recordCompletion`
+   * accepts the first and refuses the second — its `where` matches every
+   * in-flight status plus an equal one, so a refusal proves the row already
+   * landed and carries a DIFFERENT outcome. The topic must then be settled for
+   * what landed. Settling for the late callback instead would flip `unread`
+   * (a clean finish) to `active` (an interruption) or the other way round,
+   * depending purely on which of the two reached its settle first.
+   */
+  it('settles for a `done` row when a late `interrupted` callback loses the race', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = {
+      findById: vi.fn(async () => ({ id: 'op-1', status: 'done' })),
+      recordCompletion: vi.fn(async () => false),
+      sumChildUsage: vi.fn(async () => undefined),
+    };
+
+    await lifecycle.dispatchHooks('op-1', state({ status: 'interrupted' }), 'interrupted');
+
+    // The run finished cleanly, so the user may not have watched it.
+    expect(mockSettleRunningOperation).toHaveBeenCalledWith('tpc_1', 'op-1', 'unread');
+  });
+
+  it('settles for an `interrupted` row when a late `done` callback loses the race', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = {
+      findById: vi.fn(async () => ({ id: 'op-1', status: 'interrupted' })),
+      recordCompletion: vi.fn(async () => false),
+      sumChildUsage: vi.fn(async () => undefined),
+    };
+
+    await lifecycle.dispatchHooks('op-1', state({ status: 'done' }), 'done');
+
+    // The stopping point was a visible interruption, not a clean finish.
+    expect(mockSettleRunningOperation).toHaveBeenCalledWith('tpc_1', 'op-1', 'active');
+  });
+
+  it('leaves the mark when the refused row is not an ending either', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = {
+      // `idle` is outside `recordCompletion`'s in-flight set, so a row that
+      // never started can refuse a terminal write while still not being over.
+      findById: vi.fn(async () => ({ id: 'op-1', status: 'idle' })),
+      recordCompletion: vi.fn(async () => false),
+      sumChildUsage: vi.fn(async () => undefined),
+    };
+
+    await lifecycle.dispatchHooks('op-1', state({ status: 'done' }), 'done');
+
+    expect(mockSettleRunningOperation).not.toHaveBeenCalled();
+  });
+
+  it('treats losing the race to a newer run as a no-op', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = acceptingOperationModel();
+    mockSettleRunningOperation.mockResolvedValue({ status: 'conflict' });
+
+    await expect(lifecycle.dispatchHooks('op-1', state(), 'interrupted')).resolves.toBeUndefined();
+
+    expect(mockSettleRunningOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it('never fails the completion when the topic cannot be settled', async () => {
+    const lifecycle = buildLifecycle();
+    (lifecycle as any).agentOperationModel = acceptingOperationModel();
+    mockSettleRunningOperation.mockRejectedValue(new Error('topic row is locked'));
+
+    await expect(lifecycle.dispatchHooks('op-1', state(), 'interrupted')).resolves.toBeUndefined();
   });
 });
 
@@ -723,7 +1158,26 @@ describe('CompletionLifecycle.dispatchHooks — async-tool park', () => {
 
     await lifecycle.dispatchHooks('op-1', parkedState, 'waiting_for_async_tool');
 
-    expect(persistSpy).toHaveBeenCalledWith('op-1', parkedState, 'waiting_for_async_tool');
+    expect(persistSpy).toHaveBeenCalledWith(
+      'op-1',
+      parkedState,
+      'waiting_for_async_tool',
+      undefined,
+    );
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(unregisterSpy).not.toHaveBeenCalled();
+  });
+
+  it('treats a waiting_for_client park the same way: persisted, no onComplete, hooks kept', async () => {
+    const lifecycle = buildLifecycle();
+    const persistSpy = vi.spyOn(lifecycle as any, 'persistCompletion').mockResolvedValue(undefined);
+    const dispatchSpy = vi.spyOn(hookDispatcher, 'dispatch').mockResolvedValue(undefined as any);
+    const unregisterSpy = vi.spyOn(hookDispatcher, 'unregister').mockImplementation(function () {});
+    const clientPark = { ...parkedState, status: 'waiting_for_client' };
+
+    await lifecycle.dispatchHooks('op-1', clientPark, 'waiting_for_client');
+
+    expect(persistSpy).toHaveBeenCalledWith('op-1', clientPark, 'waiting_for_client', undefined);
     expect(dispatchSpy).not.toHaveBeenCalled();
     expect(unregisterSpy).not.toHaveBeenCalled();
   });
@@ -1239,6 +1693,27 @@ describe('CompletionLifecycle.dispatchHooks — lastAssistantContent DB recovery
     );
   });
 
+  it('extracts final Markdown images when the reply is recovered from the database', async () => {
+    const lifecycle = buildLifecycle();
+    const dispatchSpy = setupSpies(lifecycle);
+    const content = '![Result](https://cdn.example.com/recovered.png)';
+    (lifecycle as any).messageModel = {
+      findById: vi.fn().mockResolvedValue({ content, id: 'msg-assistant' }),
+    };
+
+    await lifecycle.dispatchHooks('op-1', buildDoneState(''), 'done');
+
+    expect(dispatchSpy).toHaveBeenCalledWith(
+      'op-1',
+      'onComplete',
+      expect.objectContaining({
+        attachments: [{ fetchUrl: 'https://cdn.example.com/recovered.png', type: 'image' }],
+        lastAssistantContent: content,
+      }),
+      [],
+    );
+  });
+
   it('recovers by the final assistantGroup child id when grouped state carries no text', async () => {
     const lifecycle = buildLifecycle();
     const dispatchSpy = setupSpies(lifecycle);
@@ -1474,6 +1949,69 @@ describe('CompletionLifecycle.emitSignalEvents — assistant anchor', () => {
     });
   });
 
+  it('reads a memory-writer run thread when the terminal state carries no messages', async () => {
+    const emitSpy = vi
+      .spyOn(agentSignalService, 'emitAgentSignalSourceEvent')
+      .mockResolvedValue(undefined as any);
+    const lifecycle = buildLifecycle();
+    const query = vi.spyOn(lifecycle['messageModel'], 'query').mockResolvedValue([
+      {
+        id: 'msg-tool-call',
+        role: 'assistant',
+        tools: [
+          {
+            apiName: 'addPreferenceMemory',
+            arguments: JSON.stringify({
+              summary: 'Answer in bullets',
+              title: 'Prefers bullet answers',
+            }),
+            id: 'call_pref',
+            identifier: 'lobe-user-memory',
+            type: 'builtin',
+          },
+        ],
+      },
+      {
+        content: 'Preference memory saved with memoryId: "mem_1" and preferenceId: "pref_1"',
+        id: 'msg-tool-result',
+        role: 'tool',
+        tool_call_id: 'call_pref',
+      },
+    ] as any);
+
+    await lifecycle.emitSignalEvents(
+      'op-memory',
+      {
+        messages: [],
+        origin: {
+          agentId: 'agent-1',
+          signal: { kind: 'memory', sourceId: 'memory-source-1', topicId: 'tpc-1' },
+          threadId: 'thd-memory',
+          topicId: 'tpc-1',
+          userId: 'user-1',
+        },
+        stepCount: 3,
+        usage: {
+          tools: {
+            byTool: [{ calls: 1, errors: 0, name: 'lobe-user-memory/addPreferenceMemory' }],
+          },
+        },
+      },
+      'done',
+    );
+
+    expect(query).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: 'thd-memory', topicId: 'tpc-1' }),
+      expect.anything(),
+    );
+    const [emission] = emitSpy.mock.calls[0];
+    expect(emission.payload.selfIteration.mutations[0].data.target).toMatchObject({
+      id: 'pref_1',
+      memoryId: 'mem_1',
+      title: 'Prefers bullet answers',
+    });
+  });
+
   it('hydrates a persisted self-reflection marker when terminal state metadata lost it', async () => {
     const emitSpy = vi
       .spyOn(agentSignalService, 'emitAgentSignalSourceEvent')
@@ -1690,5 +2228,53 @@ describe('CompletionLifecycle.registerFileWorks', () => {
 
     await expect(lifecycle.registerFileWorks('op-1', {} as any)).resolves.toBeUndefined();
     expect(mockRegister).toHaveBeenCalledTimes(1);
+  });
+
+  it('registers and anchors a share visitor run under its visitor-topic share scope', async () => {
+    mockRegister.mockClear();
+    vi.mocked(WorkModel).mockClear();
+    mockRegister.mockResolvedValue({ attempted: 1, failed: 0 });
+    mockListWorks.mockResolvedValue([{ id: 'visitor-file-work' }]);
+    const lifecycle = buildLifecycle();
+    const update = vi
+      .spyOn(lifecycle['messageModel'], 'update')
+      .mockResolvedValue({ success: true });
+    const shareVisitor = { agentId: 'agt_1', shareId: 'share-1', visitorUserId: 'visitor-1' };
+    const state = {
+      metadata: { workAssistantMessageId: 'final-assistant' },
+      origin: { sourceMessageId: 'source-user', topicId: 'tpc_visitor', userId: 'user-1' },
+      principal: { actor: { shareVisitor } },
+    };
+
+    await lifecycle.registerFileWorks('op-1', state);
+
+    expect(mockRegister).toHaveBeenCalledWith(
+      expect.objectContaining({ agentShareVisitor: shareVisitor, operationId: 'op-1' }),
+    );
+    // The anchor lookup must read through the SAME scope the scan wrote under,
+    // or the visitor's Work is never found and the chip never renders.
+    expect(vi.mocked(WorkModel)).toHaveBeenCalledWith(expect.anything(), 'user-1', undefined, {
+      shareId: 'share-1',
+      topicId: 'tpc_visitor',
+      type: 'agentShare',
+      visitorUserId: 'visitor-1',
+    });
+    expect(update).toHaveBeenCalledWith('final-assistant', {
+      metadata: { work: { rootOperationId: 'op-1', userMessageId: 'source-user' } },
+    });
+  });
+
+  it('skips a share visitor run that has no topic instead of registering unscoped', async () => {
+    mockRegister.mockClear();
+    const lifecycle = buildLifecycle();
+    const state = {
+      metadata: {},
+      origin: { userId: 'user-1' },
+      principal: { actor: { shareVisitor: { shareId: 'share-1', visitorUserId: 'visitor-1' } } },
+    };
+
+    await expect(lifecycle.registerFileWorks('op-1', state)).resolves.toBeUndefined();
+    expect(mockRegister).not.toHaveBeenCalled();
+    expect(state.metadata).not.toHaveProperty('_fileWorksRegistered');
   });
 });

@@ -1,7 +1,6 @@
 'use client';
 
-import { Flexbox } from '@lobehub/ui';
-import { createStaticStyles, cssVar, useResponsive } from 'antd-style';
+import { createStaticStyles, cssVar, Flexbox, useResponsive } from '@lobehub/ui';
 import { useState } from 'react';
 import { useLocation } from 'react-router';
 
@@ -10,7 +9,7 @@ import AcceptanceCheckInventory from './Checks/AcceptanceCheckInventory';
 import AcceptanceCheckOwnerToolbar from './Checks/AcceptanceCheckOwnerToolbar';
 import AcceptanceDiscussion from './Comments/AcceptanceDiscussion';
 import { commentIdFromHash } from './Comments/anchor';
-import { messageThreads } from './Comments/discussionTimeline';
+import { countDiscussionMessages } from './Comments/discussionTimeline';
 import { useAcceptanceComments } from './Comments/hooks';
 import ReviewerApprovalBar from './Comments/ReviewerApprovalBar';
 import AcceptanceOriginTopic from './Conversation/AcceptanceOriginTopic';
@@ -18,6 +17,7 @@ import AcceptanceResources from './Evidence/AcceptanceResources';
 import { AcceptanceFlow } from './Flow/AcceptanceFlow';
 import { getFlowNodeCount, resolveAcceptanceTab } from './Flow/flowNavigation';
 import AcceptanceEnterFocus from './Focus/AcceptanceEnterFocus';
+import GateReview from './Gate/GateReview';
 import AcceptanceGoal from './Header/AcceptanceGoal';
 import AcceptanceGoalEdit from './Header/AcceptanceGoalEdit';
 import AcceptanceIdentity from './Header/AcceptanceIdentity';
@@ -64,19 +64,23 @@ export const AcceptanceOverview = ({
   const { acceptanceId, embedded } = useAcceptanceScope();
   const { turn } = useAcceptanceTurn(embedded);
   const { data } = useAcceptanceBundle(acceptanceId);
-  const { threads } = useAcceptanceComments(acceptanceId);
+  const { items, threads } = useAcceptanceComments(acceptanceId);
   const [requestedTab, setTab] = useState<AcceptanceTabKey>();
   // A link to one comment has to land on the tab that shows it. The reader can
   // still leave: their own tab choice, once made, outranks the fragment.
   const { hash } = useLocation();
+  const rounds = data?.rounds ?? [];
   const flowCount = getFlowNodeCount(data?.flows);
   const tab = resolveAcceptanceTab(
     requestedTab ?? (!embedded && commentIdFromHash(hash) ? 'discussion' : undefined),
     flowCount,
-    Boolean(flowPlanPhase(data?.rounds.at(-1))),
+    Boolean(flowPlanPhase(rounds.at(-1))),
     md,
   );
   const checks = data ? checksForTurn(data, turn) : [];
+  // A Goal decision gate reviews its own frozen dossier, not a checklist.
+  const gateDossier =
+    data?.subject.type === 'goal_gate' ? rounds.at(-1)?.run.metadata?.releaseGate : undefined;
   const resourceCount = new Set(
     checks.flatMap((check) =>
       (check.evidence ?? [])
@@ -94,7 +98,7 @@ export const AcceptanceOverview = ({
             statusSlot={<AcceptanceStatusControl />}
             topicSlot={<AcceptanceOriginTopic />}
           />
-          <AcceptanceGoal editSlot={<AcceptanceGoalEdit />} />
+          {!gateDossier && <AcceptanceGoal editSlot={<AcceptanceGoalEdit />} />}
           {/* The requirement needs room to land before the tabs start a new
               thought — at the band's uniform gap it read as another row of
               the same list. */}
@@ -102,9 +106,15 @@ export const AcceptanceOverview = ({
             <AcceptanceTabs
               active={tab}
               checkCount={checks.length}
-              discussionCount={messageThreads(threads).length}
               flowCount={md ? flowCount : 0}
               resourceCount={resourceCount}
+              discussionCount={countDiscussionMessages({
+                approvals: [],
+                checks: data?.checks,
+                items,
+                rounds: rounds.map(({ run }) => run),
+                threads,
+              })}
               onChange={setTab}
             />
           </Flexbox>
@@ -124,12 +134,14 @@ export const AcceptanceOverview = ({
             reviewer's "fine by me" — or a reviewer would lose the affordance
             entirely. */}
         {tab === 'discussion' ? (
-          <AcceptanceDiscussion />
+          <AcceptanceDiscussion onOpenChecks={() => setTab('checks')} />
         ) : tab === 'flow' ? (
           <>
             <AcceptanceFlow />
             <AcceptanceDecision onDraftToComposer={onDraftToComposer} />
           </>
+        ) : tab === 'checks' && gateDossier ? (
+          <GateReview dossier={gateDossier} />
         ) : tab === 'checks' ? (
           <>
             <AcceptanceCheckInventory toolbar={<AcceptanceCheckOwnerToolbar />} />

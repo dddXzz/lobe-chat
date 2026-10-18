@@ -3,9 +3,7 @@ import type {
   DeviceGitPullRequestDetail,
   DeviceGitPullRequestReview,
 } from '@lobechat/types';
-import { Flexbox, Icon, Markdown } from '@lobehub/ui';
-import { Avatar, Button, TextArea } from '@lobehub/ui/base-ui';
-import { createStaticStyles } from 'antd-style';
+import { Avatar, Button, createStaticStyles, Flexbox, Icon, Markdown, TextArea } from '@lobehub/ui';
 import type { LucideIcon } from 'lucide-react';
 import { CheckIcon, CircleSlashIcon, EyeIcon, GitCommitHorizontalIcon, XIcon } from 'lucide-react';
 import { memo, useMemo, useState } from 'react';
@@ -178,7 +176,7 @@ const ActivityTimeline = memo<ActivityTimelineProps>(({ busy, detail, onAction }
                 <span>{timeAgo(entry.at)}</span>
               </Flexbox>
               <div className={styles.commentBodyWrap}>
-                <Markdown allowHtml className={styles.commentBody} fontSize={13} variant={'chat'}>
+                <Markdown className={styles.commentBody} fontSize={13} variant={'chat'}>
                   {entry.body}
                 </Markdown>
               </div>

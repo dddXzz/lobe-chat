@@ -3,7 +3,10 @@ import { createCallAgentManifest } from '@lobechat/builtin-tool-agent-management
 import { GoalIdentifier, isGoalPrompt } from '@lobechat/builtin-tool-goal';
 import { isDesktop, isHeterogeneousAgentModelId, LOADING_FLAT } from '@lobechat/const';
 import { formatSelectedSkillsContext, formatSelectedToolsContext } from '@lobechat/context-engine';
-import { isRemoteHeterogeneousType } from '@lobechat/heterogeneous-agents';
+import {
+  collectHeteroAttachedFiles,
+  isRemoteHeterogeneousType,
+} from '@lobechat/heterogeneous-agents';
 import { chainCompressContext } from '@lobechat/prompts';
 import type {
   ChatAudioItem,
@@ -20,10 +23,11 @@ import {
   applyTopicModelToHeterogeneousProvider,
   getWorkingDirEffectivePath,
   getWorkingDirSourcePath,
+  RequestTrigger,
   resolveAgentAgencyConfig,
 } from '@lobechat/types';
 import { generateEntityId, nanoid } from '@lobechat/utils';
-import { toast } from '@lobehub/ui/base-ui';
+import { toast } from '@lobehub/ui';
 import { t } from 'i18next';
 
 import { type ChatInputEditor } from '@/features/ChatInput';
@@ -38,18 +42,21 @@ import {
   resolveTargetDeviceId,
 } from '@/helpers/agentWorkingDirectory';
 import {
+  applyTopicDeviceBinding,
+  getTopicBoundDeviceId,
   resolveExecutionTarget,
   resolveToolMode,
   resolveWorkspaceScoped,
 } from '@/helpers/executionTarget';
 import { globalAgentContextManager } from '@/helpers/GlobalAgentContextManager';
 import { agentService } from '@/services/agent';
-import { aiAgentService } from '@/services/aiAgent';
+import { aiAgentService, MAX_CLIENT_OPERATION_SNAPSHOT } from '@/services/aiAgent';
 import { aiChatService } from '@/services/aiChat';
 import { chatService } from '@/services/chat';
 import { resolveSelectedSkillsWithContent } from '@/services/chat/mecha/skillPreload';
 import { resolveSelectedToolsWithContent } from '@/services/chat/mecha/toolPreload';
 import { messageService } from '@/services/message';
+import { projectWorkingDirectoryService } from '@/services/projectWorkingDirectory';
 import { topicService } from '@/services/topic';
 import { getAgentStoreState } from '@/store/agent';
 import {
@@ -58,10 +65,12 @@ import {
   chatConfigByIdSelectors,
 } from '@/store/agent/selectors';
 import { agentGroupByIdSelectors, getChatGroupStoreState } from '@/store/agentGroup';
+import { getPendingSandboxSelection } from '@/store/chat/pendingSandboxSelection';
 import { getPendingTopicRepos } from '@/store/chat/pendingTopicRepos';
 import {
   dbMessageSelectors,
   displayMessageSelectors,
+  operationSelectors,
   topicSelectors,
 } from '@/store/chat/selectors';
 import { selectRuntimeType } from '@/store/chat/slices/agentRun/actions/dispatch/agentDispatcher';
@@ -101,6 +110,7 @@ import { getElectronStoreState } from '@/store/electron';
 import { getFileStoreState } from '@/store/file/store';
 import { useGlobalStore } from '@/store/global';
 import { systemStatusSelectors } from '@/store/global/selectors';
+import { findProjectDirectory } from '@/store/projectWorkingDirectory';
 import { pageAgentRuntime } from '@/store/tool/slices/builtin/executors/pageAgentRuntime';
 import { type StoreSetter } from '@/store/types';
 import { getUserStoreState } from '@/store/user';
@@ -136,7 +146,8 @@ export interface SendMessageWithContextParams extends SendMessageParams {
   /**
    * Editor owned by the calling ConversationProvider. Embedded conversations
    * must not fall back to ChatStore's global editor, which may belong to a
-   * sibling panel.
+   * sibling panel. Pass `null` when the send is not backed by a composer editor
+   * at all, so a failed send is not written into the global one.
    */
   inputEditor?: ChatInputEditor | null;
   /** Restore composer-owned context when sending fails before a message owns it. */
@@ -337,6 +348,18 @@ export class ConversationLifecycleActionImpl {
     let detachCallerAbort = () => {};
     let hasNotifiedMessageAccepted = false;
     let sendOperationId: string | undefined = undefined;
+    // Where the user was when they hit send. This send's continuations adopt the
+    // topic it creates only while the conversation is still here — the awaited
+    // preflight (access check, snapshots, topic resolution) is long enough for
+    // the user to open another topic, and following them with a switchTopic
+    // would yank both the message list and the URL back (see the
+    // `onlyIfActiveTopicIn` guards below). The agent and group are pinned too:
+    // two blank views share `activeTopicId === null`, so the topic guard alone
+    // cannot tell "still on the origin blank view" from "moved to another
+    // agent's/group's blank view".
+    const sendOriginActiveTopicId = this.#get().activeTopicId || null;
+    const sendOriginActiveAgentId = this.#get().activeAgentId ?? null;
+    const sendOriginActiveGroupId = this.#get().activeGroupId ?? null;
     const detachUnacceptedCallerAbort = () => {
       if (!hasNotifiedMessageAccepted) detachCallerAbort();
     };
@@ -371,7 +394,12 @@ export class ConversationLifecycleActionImpl {
 
     let editorData = inputEditorData;
     const { executeClientAgent, mainInputEditor } = this.#get();
-    const targetInputEditor = inputEditor ?? mainInputEditor;
+    // `inputEditor` names the editor that owns this send. An explicit `null`
+    // means "this send has no composer editor": an embedded reply (a task run's
+    // inline follow-up) must not fall back to ChatStore's global editor, which
+    // belongs to a sibling surface and would be refilled with this send's text
+    // when it fails. Only an omitted editor falls back to the global one.
+    const targetInputEditor = inputEditor === undefined ? mainInputEditor : inputEditor;
     const ownerAgentId = context.agentId;
     const selectedSkills = parseSelectedSkillsFromEditorData(editorData);
     const selectedTools = parseSelectedToolsFromEditorData(editorData);
@@ -446,16 +474,67 @@ export class ConversationLifecycleActionImpl {
     const deviceOverride = agent?.workspaceId
       ? getUserStoreState().workspaceUserPreference.agentDeviceOverrides?.[agentId]
       : undefined;
-    const workspaceScoped = resolveWorkspaceScoped(usesWorkspaceMemberSelection, deviceOverride);
     // Runtime selection must use the same per-user device override as the
     // switcher. A workspace-local pick is intentionally private to this member
-    // and is therefore safe to execute in-process on their desktop.
-    const agencyConfig = resolveAgentAgencyConfig(agentConfig?.agencyConfig, deviceOverride, {
-      canManage,
-      visibility: agent?.visibility,
-      workspaceId: agent?.workspaceId,
-    });
+    // and is therefore safe to execute in-process on their desktop. An existing
+    // conversation then stays on the machine it already ran on.
+    const topicBinding = applyTopicDeviceBinding(
+      {
+        agencyConfig: resolveAgentAgencyConfig(agentConfig?.agencyConfig, deviceOverride, {
+          canManage,
+          visibility: agent?.visibility,
+          workspaceId: agent?.workspaceId,
+        }),
+        workspaceScoped: resolveWorkspaceScoped(usesWorkspaceMemberSelection, deviceOverride),
+      },
+      getTopicBoundDeviceId(
+        context.topicId ? topicSelectors.getTopicById(context.topicId)(this.#get()) : undefined,
+        agentId,
+      ),
+      getElectronStoreState().gatewayDeviceInfo?.deviceId,
+    );
+    const { workspaceScoped } = topicBinding;
+    let { agencyConfig } = topicBinding;
     const isGatewayMode = this.#get().isGatewayModeEnabled(agentId);
+    const boundTopic = context.topicId
+      ? topicSelectors.getTopicById(context.topicId)(this.#get())
+      : undefined;
+    // A blank conversation opened from a project group's "+" runs in the
+    // directory it staged; the gateway transport has the server bind the topic.
+    const pendingDirectory = this.#get().pendingNewTopicDirectory;
+    const stagedDirectoryId =
+      !context.topicId &&
+      !context.isolatedTopic &&
+      !context.groupId &&
+      !directMentionRoute &&
+      pendingDirectory?.agentId === ownerAgentId
+        ? pendingDirectory.projectWorkingDirectoryId
+        : undefined;
+    const projectDirectoryId = boundTopic?.projectWorkingDirectoryId ?? stagedDirectoryId;
+    let stagedDirectory: { id: string; projectId: string } | undefined;
+    if (projectDirectoryId) {
+      // The sidebar's directory replica already holds the row; read it locally
+      // so the optimistic pair is not held behind a network round trip. The
+      // server re-validates the directory (environment link, enabled state,
+      // permission) when it starts the run. Only a cold replica pays for resolve.
+      const directory =
+        findProjectDirectory(projectDirectoryId) ??
+        (await projectWorkingDirectoryService.resolve(projectDirectoryId)).data;
+      if (stagedDirectoryId) stagedDirectory = directory;
+      if (!isGatewayMode)
+        throw new Error('Enable Gateway Mode to run in a project working directory');
+      if (
+        agencyConfig?.executionTargetSelectionPolicy === 'fixed' &&
+        agencyConfig.boundDeviceId !== directory.deviceId
+      )
+        throw new Error('Agent is fixed to another execution target');
+      agencyConfig = {
+        ...agencyConfig,
+        boundDeviceId: directory.deviceId,
+        executionTarget: 'device',
+      };
+    }
+
     // Legacy agents may only carry `model: '<cli-type>'`. Keep gateway routing
     // unchanged when it is available. Recover the provider when gateway mode is
     // off so desktop can still spawn locally and non-desktop (Android/web) still
@@ -712,7 +791,11 @@ export class ConversationLifecycleActionImpl {
         break;
       }
     }
-    if (runningQueueBlockingOp) {
+    const queueDrainPending =
+      !runningQueueBlockingOp &&
+      !onlyAddUserMessage &&
+      operationSelectors.isQueueDrainPending(operationContext)(this.#get());
+    if (runningQueueBlockingOp || queueDrainPending) {
       // Snapshot file previews so the tray can render thumbnails AND the
       // resumed sendMessage can rebuild audioList/imageList/videoList — by the time
       // we drain, chatUploadFileList has long been cleared.
@@ -737,7 +820,7 @@ export class ConversationLifecycleActionImpl {
           metadata: userMessageMetadata,
           createdAt: Date.now(),
         },
-        runningQueueBlockingOp.id,
+        runningQueueBlockingOp?.id,
       );
       notifyMessageAccepted();
       return;
@@ -799,15 +882,28 @@ export class ConversationLifecycleActionImpl {
       return;
     }
 
-    const replaceableGatewayOperationId = queueCandidateKeys
+    const serverRuntimeOperations = queueCandidateKeys
       .flatMap((key) => this.#get().operationsByContext[key] || [])
       .map((id) => this.#get().operations[id])
-      .findLast(
-        (operation) =>
-          operation?.type === 'execServerAgentRuntime' &&
-          operation.status === 'running' &&
-          (operation.metadata.isAborting || operation.metadata.visibleLoadingDone),
-      )?.metadata.serverOperationId;
+      .filter((operation) => operation?.type === 'execServerAgentRuntime');
+
+    const replaceableGatewayOperationId = serverRuntimeOperations.findLast(
+      (operation) =>
+        operation.status === 'running' &&
+        (operation.metadata.isAborting || operation.metadata.visibleLoadingDone),
+    )?.metadata.serverOperationId;
+
+    // What this client believes about the conversation's server runs. The
+    // server keeps it only when the send has to stop a run left live.
+    const clientOperations = serverRuntimeOperations
+      .filter((operation) => operation.metadata.serverOperationId)
+      .slice(-MAX_CLIENT_OPERATION_SNAPSHOT)
+      .map((operation) => ({
+        isAborting: operation.metadata.isAborting,
+        operationId: operation.metadata.serverOperationId!,
+        status: operation.status,
+        visibleLoadingDone: operation.metadata.visibleLoadingDone,
+      }));
 
     if (onlyAddUserMessage) {
       await this.#get().addUserMessage({
@@ -858,6 +954,9 @@ export class ConversationLifecycleActionImpl {
     // whole send.
     const tempId = optimisticUserMessageId ?? generateEntityId('messages');
     const tempAssistantId = generateEntityId('messages');
+    const steeredTurnStartTime = (metadata as Pick<MessageMetadata, 'steer'> | undefined)?.steer
+      ? operationSelectors.getLatestAgentRuntimeTurnStartTime(operationContext)(this.#get())
+      : undefined;
     const { operationId, abortController } = this.#get().startOperation({
       type: 'sendMessage',
       context: { ...operationContext, messageId: tempId },
@@ -865,6 +964,7 @@ export class ConversationLifecycleActionImpl {
       metadata: {
         // Mark this as thread operation if threadId exists
         inThread: !!operationContext.threadId,
+        ...(steeredTurnStartTime === undefined ? {} : { turnStartTime: steeredTurnStartTime }),
       },
     });
     sendOperationId = operationId;
@@ -910,6 +1010,12 @@ export class ConversationLifecycleActionImpl {
       } else {
         targetInputEditor?.setDocument('markdown', message);
       }
+
+      // The editor snapshot covers only text. A send rejected after the composer
+      // was cleared (e.g. the server refusing an offline bound device) would
+      // otherwise still swallow the cleared uploads and context selections —
+      // hand them back to the caller that captured them before clearing.
+      onPreflightFailure?.();
     };
     const restoreUnacceptedVoiceMessageContext = () => {
       if (!optimisticUserMessageId || hasNotifiedMessageAccepted) return;
@@ -1084,6 +1190,11 @@ export class ConversationLifecycleActionImpl {
           value: {
             id: mintedTopicId,
             ...newTopicModelSnapshot,
+            // Shown under its project group from the first frame.
+            ...(stagedDirectory && {
+              projectId: stagedDirectory.projectId,
+              projectWorkingDirectoryId: stagedDirectory.id,
+            }),
             ...(operationContext.groupId ? {} : { sessionId: operationContext.agentId }),
             title: newTopicTitle,
           },
@@ -1094,7 +1205,18 @@ export class ConversationLifecycleActionImpl {
         messageMapKey({ ...operationContext, topicId: null }),
         currentContextKey,
       );
-      await this.#get().switchTopic(mintedTopicId, { skipRefreshMessage: true });
+      // Adopt the minted bucket only while the user is still on the view this
+      // send started from. If they navigated away while the awaits above
+      // (access check, snapshots) were in flight, don't yank them onto the new
+      // topic's bucket. The agent/group pins cover the blank-view case: a
+      // null topic origin and another conversation's null topic view are
+      // indistinguishable without them.
+      await this.#get().switchTopic(mintedTopicId, {
+        onlyIfActiveAgentId: sendOriginActiveAgentId,
+        onlyIfActiveGroupId: sendOriginActiveGroupId,
+        onlyIfActiveTopicIn: [sendOriginActiveTopicId],
+        skipRefreshMessage: true,
+      });
     }
 
     // The topic list store is paginated — a deep-linked older topic can be the
@@ -1187,15 +1309,30 @@ export class ConversationLifecycleActionImpl {
     const resolveWorkingDirPath = isLocalCliHetero
       ? getWorkingDirSourcePath
       : getWorkingDirEffectivePath;
+    // A topic's cwd is a bare path that only holds on the machine it was pinned
+    // on — never hand another machine's path to this run (mirrors the server's
+    // `topicPinFitsDevice`).
+    const topicDeviceId = existingTopic?.metadata?.boundDeviceId;
+    const topicCwdMetadata =
+      topicDeviceId && runCwdDeviceId && topicDeviceId !== runCwdDeviceId
+        ? undefined
+        : existingTopic?.metadata;
     const workingDirectory =
-      resolveWorkingDirPath(existingTopic?.metadata?.workingDirectoryConfig) ??
-      existingTopic?.metadata?.workingDirectory ??
+      resolveWorkingDirPath(topicCwdMetadata?.workingDirectoryConfig) ??
+      topicCwdMetadata?.workingDirectory ??
       agentWorkingDirectory;
     const workingDirectoryConfig =
-      existingTopic?.metadata?.workingDirectoryConfig ??
-      (existingTopic?.metadata?.workingDirectory
-        ? { path: existingTopic.metadata.workingDirectory }
+      topicCwdMetadata?.workingDirectoryConfig ??
+      (topicCwdMetadata?.workingDirectory
+        ? { path: topicCwdMetadata.workingDirectory }
         : agentWorkingDirectoryConfig);
+    // Record which machine a new conversation runs on, so its next turn — and
+    // the device picker — stay on it after the agent default changes. `auto`
+    // has not picked a machine yet; the server stamps the one it routes to.
+    const newTopicDeviceId =
+      runEffectiveTarget === 'local' || runEffectiveTarget === 'device'
+        ? runCwdDeviceId
+        : undefined;
     const pendingTopicRepos =
       runtimeType === 'gateway' && willCreateNewTopic && operationContext.agentId
         ? getPendingTopicRepos(operationContext.agentId)
@@ -1214,14 +1351,38 @@ export class ConversationLifecycleActionImpl {
           }
         : workingDirectory
           ? {
+              ...(newTopicDeviceId ? { boundDeviceId: newTopicDeviceId } : {}),
               workingDirectory,
               ...(workingDirectoryConfig ? { workingDirectoryConfig } : {}),
             }
-          : undefined;
+          : // No directory is a valid state for a native agent, but the machine
+            // still has to be recorded: the client runtime creates this topic
+            // itself, so no server turn would stamp it afterwards.
+            newTopicDeviceId
+            ? { boundDeviceId: newTopicDeviceId }
+            : undefined;
+    // Chosen in the composer while no topic existed to write it to. Not gated
+    // on runtime: the map is only ever filled by the sandbox picker, which only
+    // renders under a cloud-sandbox target.
+    const pendingSandboxSelection =
+      willCreateNewTopic && operationContext.agentId
+        ? getPendingSandboxSelection(operationContext.agentId)
+        : undefined;
+    const sandboxInstanceMetadata: ChatTopicMetadata | undefined = pendingSandboxSelection
+      ? {
+          sandboxInstanceId: pendingSandboxSelection.instanceId,
+          sandboxMode: pendingSandboxSelection.mode,
+        }
+      : undefined;
     /** First-send persistence bypasses turnSetup, so both runtime paths must carry the effort snapshot. */
-    const optimisticTopicMetadata = newTopicReasoningSnapshot
-      ? { ...workingDirectoryMetadata, ...newTopicReasoningSnapshot }
-      : workingDirectoryMetadata;
+    const optimisticTopicMetadata =
+      newTopicReasoningSnapshot || sandboxInstanceMetadata
+        ? {
+            ...workingDirectoryMetadata,
+            ...sandboxInstanceMetadata,
+            ...newTopicReasoningSnapshot,
+          }
+        : workingDirectoryMetadata;
 
     // The sidebar row was already inserted (title + model) before the awaits
     // above; the cwd/repos metadata only resolves here, so patch it on now.
@@ -1507,6 +1668,17 @@ export class ConversationLifecycleActionImpl {
         } else {
           await this.#get().switchTopic(heteroData.topicId, {
             clearNewKey: true,
+            // The cleanup targets the blank bucket this send came from — the
+            // user may be viewing a different conversation by now.
+            clearNewKeyContext: {
+              agentId: operationContext.agentId,
+              groupId: operationContext.groupId,
+            },
+            // Guard against yanking the user back if they navigated to another
+            // topic while the persistence round-trip was in flight. Accept both
+            // the minted id and the persisted one: `resolveOptimisticTopic`
+            // above re-keys `activeTopicId` from the former to the latter.
+            onlyIfActiveTopicIn: [operationContext.topicId ?? null, heteroData.topicId],
             skipRefreshMessage: true,
           });
         }
@@ -1585,7 +1757,7 @@ export class ConversationLifecycleActionImpl {
       const { operationId: heteroOpId } = this.#get().startOperation({
         context: heteroExecutionContext,
         label: 'Heterogeneous Agent Execution',
-        metadata: { heterogeneousType: heterogeneousProvider.type },
+        metadata: { heteroAutoRetryAvailable: true, heterogeneousType: heterogeneousProvider.type },
         parentOperationId: operationId,
         type: 'execHeterogeneousAgent',
       });
@@ -1600,6 +1772,7 @@ export class ConversationLifecycleActionImpl {
         // may already be cleared by this point, so we read from DB instead)
         const userMsg = heteroData.messages.find((m: any) => m.id === heteroData.userMessageId);
         const persistedImageList = userMsg?.imageList;
+        const persistedAttachedFiles = userMsg ? collectHeteroAttachedFiles(userMsg) : [];
         const persistedMetadata = userMsg?.metadata as MessageMetadata | undefined;
         const effectiveContextSelections = contextSelections?.length
           ? contextSelections
@@ -1644,6 +1817,7 @@ export class ConversationLifecycleActionImpl {
 
         await executeHeterogeneousAgent(() => this.#get(), {
           assistantMessageId: heteroExecutionAssistantId,
+          attachedFiles: persistedAttachedFiles.length ? persistedAttachedFiles : undefined,
           context: heteroExecutionContext,
           contextSelections: effectiveContextSelections,
           heterogeneousProvider: effectiveHeterogeneousProvider,
@@ -1711,13 +1885,13 @@ export class ConversationLifecycleActionImpl {
         // input loading state would drop during the execAgentTask round-trip
         // and the send button would flicker back to "send".
         const result = await this.#get().executeGatewayAgent({
-          // The ids this send's optimistic rows already render under. The
-          // server honours them, so the gateway path converges on the same ids
-          // instead of minting its own — same contract as sendMessageInServer.
+          // Ids and branch tail the optimistic rows render under; the server honours
+          // them like sendMessageInServer, so the turn stays on the visible branch.
           clientIds: {
             assistantMessageId: tempAssistantId,
             topicId: optimisticTopic?.id,
             userMessageId: tempId,
+            userMessageParentId: willCreateNewTopic ? undefined : parentId,
           },
           // Execution context: what the SERVER should act on. While creating,
           // the topic exists only client-side, so the server must see no
@@ -1738,13 +1912,19 @@ export class ConversationLifecycleActionImpl {
           onMessageAccepted: notifyMessageAccepted,
           onTopicCreated: context.isolatedTopic ? onTopicCreated : undefined,
           parentOperationId: operationId,
+          clientOperations,
           replacesOperationId: replaceableGatewayOperationId,
           optimisticTopic,
+          projectWorkingDirectoryId: stagedDirectory?.id,
           // Forward @-mentioned tool ids so the server runtime enables them for
           // this run — the gateway/server path otherwise never sees the mention
           // selection (only the client runtime did). Omit when empty.
           selectedToolIds:
             selectedTools.length > 0 ? selectedTools.map((tool) => tool.identifier) : undefined,
+          // Forward selected skills so the server injects their bodies, as the
+          // client runtime does by persisting them into the message content.
+          selectedSkillIds:
+            selectedSkills.length > 0 ? selectedSkills.map((skill) => skill.identifier) : undefined,
           // Forward @-mentioned agents so the server supervisor can delegate to
           // them (multi-mention). Mirrors the client runtime's `initialContext`
           // injection: the server enables the callAgent tool and injects the
@@ -2040,6 +2220,19 @@ export class ConversationLifecycleActionImpl {
           // clearNewKey: true ensures the _new key data is cleared after topic creation
           await this.#get().switchTopic(data.topicId, {
             clearNewKey: true,
+            // The cleanup targets the blank bucket this send came from — the
+            // user may be viewing a different conversation by now.
+            clearNewKeyContext: {
+              agentId: operationContext.agentId,
+              groupId: operationContext.groupId,
+            },
+            // The send pivoted to the minted topic bucket at send time. If the
+            // user navigated to another topic while the persistence round-trip
+            // was in flight, leave them where they are — the new topic's unread
+            // badge surfaces the completed reply instead of yanking the view back.
+            // Both ids are accepted: `resolveOptimisticTopic` above re-keys
+            // `activeTopicId` from the minted id to the persisted one.
+            onlyIfActiveTopicIn: [operationContext.topicId ?? null, data.topicId],
             skipRefreshMessage: true,
           });
         }
@@ -2330,6 +2523,7 @@ export class ConversationLifecycleActionImpl {
           }
         },
         params: { ...compressionPayload, model, provider },
+        trigger: RequestTrigger.ContextCompression,
       });
 
       if (abortController.signal.aborted) throw createAbortError();

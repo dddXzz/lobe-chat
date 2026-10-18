@@ -2,11 +2,14 @@ import type { AgentStreamEvent } from '@lobechat/agent-gateway-client';
 import { type ISnapshotStore, parseOperationId } from '@lobechat/agent-tracing';
 import type { LobeChatDatabase } from '@lobechat/database';
 import {
-  classifyHeteroProcessFailure,
-  isHeteroStatusGuideErrorData,
   type LocalHeterogeneousAgentType,
+  type LocalRuntimeHeterogeneousAgentType,
 } from '@lobechat/heterogeneous-agents';
 import { normalizeHeterogeneousMessageError } from '@lobechat/heterogeneous-agents/errors';
+import {
+  classifyHeteroProcessFailure,
+  isHeteroStatusGuideErrorData,
+} from '@lobechat/heterogeneous-agents/processFailure';
 import { ThreadStatus } from '@lobechat/types';
 import debug from 'debug';
 
@@ -33,7 +36,9 @@ import { HeteroTraceRecorder } from './HeteroTraceRecorder';
 
 const log = debug('lobe-server:hetero-agent-service');
 
-export type HeterogeneousAgentType = LocalHeterogeneousAgentType;
+/** Producers that stream through `heteroIngest`: local CLIs and bundled runtimes. */
+export type HeterogeneousAgentType =
+  LocalHeterogeneousAgentType | LocalRuntimeHeterogeneousAgentType;
 
 export type HeterogeneousFinishResult = 'success' | 'error' | 'cancelled';
 
@@ -212,6 +217,8 @@ export class HeterogeneousAgentService {
     this.persistenceHandler =
       options.persistenceHandler ??
       new HeterogeneousPersistenceHandler({
+        isOperationLiveOnTopic: (operationId, topicId) =>
+          this.agentOperationModel.isRunningOnTopic(operationId, topicId),
         messageModel: this.messageModel,
         threadModel: new ThreadModel(db, userId, workspaceId),
         topicModel: this.topicModel,

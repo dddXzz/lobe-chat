@@ -36,6 +36,15 @@ export interface RegisterDeviceParams {
   platform?: string | null;
 }
 
+/**
+ * Re-registration merges the reported bag instead of replacing it: the desktop
+ * app (`appVersion`) and `lh connect` (`cliVersion`) share one row on the same
+ * machine, and whichever connects last must not erase the other's version.
+ * Keys a client reports again are overwritten; `undefined` leaves the bag alone.
+ */
+const mergeReportedMetadata = (metadata: RegisterDeviceParams['metadata']) =>
+  metadata ? sql`coalesce(${devices.metadata}, '{}'::jsonb) || excluded.metadata` : undefined;
+
 /** Columns the user owns — never overwritten by an auto-register upsert. */
 export interface UpdateDeviceParams {
   defaultCwd?: string | null;
@@ -121,7 +130,7 @@ export class DeviceModel {
           hostname: params.hostname,
           identitySource: params.identitySource,
           lastSeenAt: now,
-          metadata: params.metadata,
+          metadata: mergeReportedMetadata(params.metadata),
           platform: params.platform,
         },
         target: [devices.userId, devices.deviceId],
@@ -217,7 +226,7 @@ export class DeviceModel {
           hostname: params.hostname,
           identitySource: params.identitySource,
           lastSeenAt: now,
-          metadata: params.metadata,
+          metadata: mergeReportedMetadata(params.metadata),
           platform: params.platform,
           visibility: params.visibility === 'public' ? 'public' : sql`${devices.visibility}`,
         },
@@ -304,6 +313,21 @@ export class DeviceModel {
     });
   };
 
+  /**
+   * The caller's PERSONAL row for a deviceId. Unlike `findByDeviceId`, never
+   * resolves to a workspace enrollment of the same machine, which may share the
+   * deviceId (the personal and workspace unique indexes are partial).
+   */
+  findPersonalByDeviceId = async (deviceId: string) => {
+    return this.db.query.devices.findFirst({
+      where: and(
+        eq(devices.userId, this.userId),
+        eq(devices.deviceId, deviceId),
+        isNull(devices.workspaceId),
+      ),
+    });
+  };
+
   update = async (deviceId: string, value: UpdateDeviceParams) => {
     return this.db
       .update(devices)
@@ -347,6 +371,33 @@ export class DeviceModel {
       .update(devices)
       .set({ ...value, updatedAt: new Date() })
       .where(and(eq(devices.workspaceId, this.workspaceId), eq(devices.deviceId, deviceId)));
+  };
+
+  /**
+   * Read-modify-write a WORKSPACE device's `workingDirs` under a row lock, so
+   * concurrent members adding or removing one directory each cannot overwrite
+   * the other's change with a stale client snapshot. Returns the stored list,
+   * or `undefined` when the device is not in the current workspace.
+   */
+  mutateWorkspaceDeviceWorkingDirs = async (
+    deviceId: string,
+    mutate: (current: WorkingDirEntry[]) => WorkingDirEntry[],
+  ): Promise<WorkingDirEntry[] | undefined> => {
+    if (!this.workspaceId) return undefined;
+    const where = and(eq(devices.workspaceId, this.workspaceId), eq(devices.deviceId, deviceId));
+
+    return this.db.transaction(async (tx) => {
+      const [row] = await tx
+        .select({ workingDirs: devices.workingDirs })
+        .from(devices)
+        .where(where)
+        .for('update');
+      if (!row) return undefined;
+
+      const next = mutate(row.workingDirs ?? []);
+      await tx.update(devices).set({ updatedAt: new Date(), workingDirs: next }).where(where);
+      return next;
+    });
   };
 
   /**

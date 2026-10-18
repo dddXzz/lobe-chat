@@ -6,24 +6,24 @@ import {
   type HeterogeneousAgentRuntimeStatus,
   useWatchBroadcast,
 } from '@lobechat/electron-client-ipc';
-import { Flexbox, Icon, Tooltip } from '@lobehub/ui';
-import { Skeleton } from '@lobehub/ui/base-ui';
-import { createStaticStyles, cssVar, cx } from 'antd-style';
+import { createStaticStyles, cssVar, cx, Flexbox, Icon, Tooltip } from '@lobehub/ui';
 import { ActivityIcon, CircleAlertIcon, RadioTowerIcon, TimerResetIcon } from 'lucide-react';
 import { memo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import ChatInputCredits from '@/business/client/features/ChatInputCredits';
-import HeteroDeviceSwitcher from '@/features/ChatInput/ControlBar/HeteroDeviceSwitcher';
+import { SkeletonBar } from '@/components/Skeleton';
+import DeviceSwitcher from '@/features/ChatInput/ControlBar/DeviceSwitcher';
 import WorkspaceControls from '@/features/ChatInput/ControlBar/WorkspaceControls';
 import { useAgentId } from '@/features/ChatInput/hooks/useAgentId';
 import { useChatInputResourceAccess } from '@/features/ChatInput/hooks/useChatInputResourceAccess';
+import { useTopicId } from '@/features/ChatInput/hooks/useTopicId';
 import { resolveExecutionTarget } from '@/helpers/executionTarget';
 import { useEffectiveAgencyConfig } from '@/hooks/useEffectiveAgencyConfig';
 import { useAgentStore } from '@/store/agent';
 import { agentByIdSelectors } from '@/store/agent/selectors';
 
-import { ClaudeCodeQuotaMenu, CodexQuotaMenu } from './QuotaMenu';
+import { ClaudeCodeQuotaMenu, CodexQuotaMenu, KimiCodeQuotaMenu } from './QuotaMenu';
 
 const styles = createStaticStyles(({ css }) => ({
   // Pinned to the same 28px row as the plain ControlBar so the composer footer
@@ -127,9 +127,30 @@ const visibleSdkRuntimeStates = new Set<HeterogeneousAgentRuntimeState>([
   'error',
 ]);
 
+/**
+ * Same 28px row as the loaded bar: the workspace / device chip on the left and,
+ * on desktop once config is known, the full-access badge on the right. Keeps the
+ * composer from jumping while access or agent config resolve.
+ */
+const HeteroControlBarSkeleton = ({ showRight }: { showRight?: boolean }) => (
+  <Flexbox
+    aria-busy
+    horizontal
+    align={'center'}
+    className={styles.bar}
+    data-testid={'hetero-control-bar-skeleton'}
+    gap={4}
+    justify={'space-between'}
+  >
+    <SkeletonBar height={22} radius={4} width={100} />
+    {showRight && <SkeletonBar height={22} radius={4} width={80} />}
+  </Flexbox>
+);
+
 const HeteroControlBar = memo(() => {
   const { t: tChat } = useTranslation('chat');
   const agentId = useAgentId();
+  const topicId = useTopicId();
   const { canConfigureResource, isAccessLoading } = useChatInputResourceAccess();
   const [runtimeStatus, setRuntimeStatus] = useState<HeterogeneousAgentRuntimeStatus>();
 
@@ -142,7 +163,7 @@ const HeteroControlBar = memo(() => {
   const isLoading = useAgentStore(agentByIdSelectors.isAgentConfigLoadingById(agentId));
   // Effective config = shared row + this member's device override,
   // so the quota badges gate on where THIS member's run actually executes.
-  const { agencyConfig, workspaceScoped } = useEffectiveAgencyConfig(agentId);
+  const { agencyConfig, workspaceScoped } = useEffectiveAgencyConfig(agentId, { topicId });
 
   const heteroProvider = agencyConfig?.heterogeneousProvider;
   const executionTarget = resolveExecutionTarget(agencyConfig, {
@@ -168,16 +189,23 @@ const HeteroControlBar = memo(() => {
     isSubscriptionAuth &&
     heteroProvider?.type === 'codex' &&
     (isLocalHeteroExecution || !!quotaDeviceId);
+  // Kimi Code carries no client-side auth mode: whether the login is a
+  // subscription is only knowable from the sampled snapshot, so gate exactly
+  // like Claude and let the snapshot's unavailable reason explain the rest.
+  const shouldShowKimiCodeQuota =
+    isSubscriptionAuth &&
+    heteroProvider?.type === 'kimi-code' &&
+    (isLocalHeteroExecution || !!quotaDeviceId);
 
-  if (isAccessLoading) return null;
+  if (isAccessLoading) return <HeteroControlBarSkeleton />;
 
   // A can-use collaborator may choose only their execution device; working
   // directory, git, provider quota and runtime details remain author/editor config.
   if (!canConfigureResource) {
-    if (!agentId || isLoading) return null;
+    if (!agentId || isLoading) return <HeteroControlBarSkeleton />;
     return (
       <Flexbox horizontal align={'center'} className={styles.bar} justify={'space-between'}>
-        <HeteroDeviceSwitcher agentId={agentId} />
+        <DeviceSwitcher agentId={agentId} />
         {shouldShowApiCredits && <ChatInputCredits />}
       </Flexbox>
     );
@@ -197,7 +225,8 @@ const HeteroControlBar = memo(() => {
         </Flexbox>
         {(shouldShowApiCredits ||
           (shouldShowClaudeQuota && quotaDeviceId) ||
-          (shouldShowCodexQuota && quotaDeviceId)) && (
+          (shouldShowCodexQuota && quotaDeviceId) ||
+          (shouldShowKimiCodeQuota && quotaDeviceId)) && (
           <Flexbox horizontal align={'center'} className={styles.rightGroup} gap={4}>
             {shouldShowApiCredits && <ChatInputCredits />}
             {shouldShowClaudeQuota && quotaDeviceId && (
@@ -210,20 +239,16 @@ const HeteroControlBar = memo(() => {
                 env={heteroProvider?.env}
               />
             )}
+            {shouldShowKimiCodeQuota && quotaDeviceId && (
+              <KimiCodeQuotaMenu deviceId={quotaDeviceId} env={heteroProvider?.env} />
+            )}
           </Flexbox>
         )}
       </Flexbox>
     );
   }
 
-  if (!agentId || isLoading) {
-    return (
-      <Flexbox horizontal align={'center'} className={styles.bar} gap={4} justify={'space-between'}>
-        <Skeleton style={{ height: 22, minWidth: 100, width: 100 }} />
-        <Skeleton style={{ height: 22, minWidth: 80, width: 80 }} />
-      </Flexbox>
-    );
-  }
+  if (!agentId || isLoading) return <HeteroControlBarSkeleton showRight />;
 
   const fullAccessBadge = (
     <div className={styles.fullAccess}>
@@ -283,6 +308,9 @@ const HeteroControlBar = memo(() => {
             deviceId={quotaDeviceId}
             env={heteroProvider?.env}
           />
+        )}
+        {shouldShowKimiCodeQuota && (
+          <KimiCodeQuotaMenu deviceId={quotaDeviceId} env={heteroProvider?.env} />
         )}
         {shouldShowClaudeQuota && (
           <ClaudeCodeQuotaMenu deviceId={quotaDeviceId} env={heteroProvider?.env} />

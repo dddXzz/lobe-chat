@@ -3,31 +3,22 @@
  */
 import type * as LobechatConstModule from '@lobechat/const';
 import type * as ElectronClientIpcModule from '@lobechat/electron-client-ipc';
-import type { HeterogeneousProviderConfig } from '@lobechat/types';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import HeteroControlBar from '..';
+import { openQuotaCalendarModal } from '@/features/AgentQuotaCalendar';
+
 import ClaudeCodeQuotaMenu from './ClaudeCodeQuotaMenu';
 import CodexQuotaMenu from './CodexQuotaMenu';
+import KimiCodeQuotaMenu from './KimiCodeQuotaMenu';
+import { codexSnapshot, kimiCodeSnapshot } from './testUtils';
 
 const mockService = vi.hoisted(() => ({
   consumeCodexRateLimitResetCredit: vi.fn(),
   getClaudeCodeQuota: vi.fn(),
   getCodexQuota: vi.fn(),
-}));
-
-const effectiveAgencyConfig = vi.hoisted(() => ({
-  current: {
-    boundDeviceId: 'personal-device' as string | undefined,
-    executionTarget: 'local' as 'local' | 'device',
-    heterogeneousProvider: {
-      command: 'codex',
-      type: 'codex',
-    } as HeterogeneousProviderConfig,
-  },
-  workspaceScoped: false,
+  getKimiCodeQuota: vi.fn(),
 }));
 
 vi.mock('@lobechat/const', async (importOriginal) => ({
@@ -40,52 +31,11 @@ vi.mock('@lobechat/electron-client-ipc', async (importOriginal) => ({
   useWatchBroadcast: vi.fn(),
 }));
 
-vi.mock('@/business/client/features/ChatInputCredits', () => ({
-  default: () => <div data-testid="api-credits" />,
-}));
-
-vi.mock('@/features/ChatInput/ControlBar/WorkspaceControls', () => ({
-  default: () => <div data-testid="workspace-controls" />,
-}));
-
-vi.mock('@/features/ChatInput/ControlBar/HeteroDeviceSwitcher', () => ({
-  default: () => <div data-testid="hetero-device-switcher" />,
-}));
-
 vi.mock('@/features/AgentQuotaCalendar', () => ({
   openQuotaCalendarModal: vi.fn(),
 }));
 
 vi.mock('@/features/ChatInput/hooks/useAgentId', () => ({ useAgentId: () => 'agent-1' }));
-
-// Resource-access gating is out of scope for quota tests — keep it permissive
-// so HeteroControlBar renders its full quota UI without the ChatInput store.
-vi.mock('@/features/ChatInput/hooks/useChatInputResourceAccess', () => ({
-  useChatInputResourceAccess: () => ({
-    canConfigureResource: true,
-    canSendMessage: true,
-    canUseResource: true,
-    isAccessLoading: false,
-  }),
-}));
-
-vi.mock('@/hooks/useEffectiveAgencyConfig', () => ({
-  useEffectiveAgencyConfig: () => ({
-    agencyConfig: effectiveAgencyConfig.current,
-    workspaceScoped: effectiveAgencyConfig.workspaceScoped,
-  }),
-}));
-
-vi.mock('@/store/agent', () => ({
-  useAgentStore: (selector: (state: Record<string, unknown>) => unknown) => selector({}),
-}));
-
-vi.mock('@/store/agent/selectors', () => ({
-  agentByIdSelectors: {
-    isAgentConfigLoadingById: () => () => false,
-    isWorkspaceAgentById: () => () => true,
-  },
-}));
 
 const { confirmModalMock, toastErrorMock, toastSuccessMock } = vi.hoisted(() => ({
   confirmModalMock: vi.fn(),
@@ -104,9 +54,10 @@ vi.mock('@/services/electron/heterogeneousAgent', () => ({
 
 // A `deviceId` routes the live sample through the device gateway TRPC instead
 // of Electron IPC (see `fetchClaudeCodeQuotaSnapshot`).
-const { mockLambdaClaudeQuota, mockLambdaCodexQuota } = vi.hoisted(() => ({
+const { mockLambdaClaudeQuota, mockLambdaCodexQuota, mockLambdaKimiCodeQuota } = vi.hoisted(() => ({
   mockLambdaClaudeQuota: vi.fn(),
   mockLambdaCodexQuota: vi.fn(),
+  mockLambdaKimiCodeQuota: vi.fn(),
 }));
 
 vi.mock('@/libs/trpc/client', () => ({
@@ -125,7 +76,9 @@ const mockQuotaService = vi.hoisted(() => ({
   getLatestReadings: vi.fn(async (): Promise<unknown[]> => []),
   ingestClaudeSnapshot: vi.fn(async () => undefined),
   ingestCodexSnapshot: vi.fn(async () => undefined),
+  ingestKimiCodeSnapshot: vi.fn(async () => undefined),
   refreshCodexQuota: vi.fn(),
+  refreshKimiCodeQuota: vi.fn(),
   listAccounts: vi.fn(async (): Promise<unknown[]> => []),
   listBindings: vi.fn(async (): Promise<unknown[]> => []),
 }));
@@ -141,81 +94,91 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('@lobehub/ui', async (importOriginal) => {
-  return {
-    ...(await importOriginal<object>()),
-    ActionIcon: ({
-      disabled,
-      onClick,
-      title,
-    }: {
-      disabled?: boolean;
-      onClick?: () => void;
-      title?: string;
-    }) => (
-      <button
-        aria-label={title}
-        data-testid={title ? 'calendar' : 'refresh'}
-        disabled={disabled}
-        type="button"
-        onClick={onClick}
-      />
-    ),
-    Flexbox: ({ children, className }: { children?: ReactNode; className?: string }) => (
-      <div className={className}>{children}</div>
-    ),
-    Icon: () => <svg />,
-    // Render the popover content unconditionally so window rows are assertable
-    // without driving the open/close interaction.
-    Popover: ({
-      children,
-      content,
-      onOpenChange,
-    }: {
-      children?: ReactNode;
-      content?: ReactNode;
-      onOpenChange?: (open: boolean) => void;
-    }) => (
-      <div>
-        <div data-testid="popover-content">{content}</div>
-        <div data-testid="quota-trigger" onClick={() => onOpenChange?.(true)}>
-          {children}
-        </div>
-      </div>
-    ),
-    Skeleton: { Button: () => <div data-testid="skeleton" /> },
-    Text: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
-    Tooltip: ({ children }: { children?: ReactNode }) => <>{children}</>,
-  };
+  const actual = await importOriginal<Record<string, unknown>>();
+  const factories: ((original: typeof importOriginal) => unknown)[] = [
+    async (importOriginal) => {
+      return {
+        ...(await importOriginal<object>()),
+        ActionIcon: ({
+          disabled,
+          onClick,
+          title,
+        }: {
+          disabled?: boolean;
+          onClick?: () => void;
+          title?: string;
+        }) => (
+          <button
+            aria-label={title}
+            data-testid={title ? 'calendar' : 'refresh'}
+            disabled={disabled}
+            type="button"
+            onClick={onClick}
+          />
+        ),
+        Flexbox: ({ children, className }: { children?: ReactNode; className?: string }) => (
+          <div className={className}>{children}</div>
+        ),
+        Icon: () => <svg />,
+        // Render the popover content unconditionally so window rows are assertable
+        // without driving the open/close interaction.
+        Popover: ({
+          children,
+          content,
+          onOpenChange,
+        }: {
+          children?: ReactNode;
+          content?: ReactNode;
+          onOpenChange?: (open: boolean) => void;
+        }) => (
+          <div>
+            <div data-testid="popover-content">{content}</div>
+            <div data-testid="quota-trigger" onClick={() => onOpenChange?.(true)}>
+              {children}
+            </div>
+          </div>
+        ),
+        Skeleton: { Button: () => <div data-testid="skeleton" /> },
+        Text: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
+        Tooltip: ({ children }: { children?: ReactNode }) => <>{children}</>,
+      };
+    },
+    async (importOriginal) => ({
+      ...((await importOriginal()) as Record<string, unknown>),
+      ActionIcon: ({
+        onClick,
+        title,
+        disabled,
+      }: {
+        disabled?: boolean;
+        onClick?: (e: React.MouseEvent) => void;
+        title?: string;
+      }) => (
+        <button
+          aria-label={title}
+          data-testid={title ? 'calendar' : 'refresh'}
+          disabled={disabled}
+          type="button"
+          onClick={onClick}
+        />
+      ),
+      confirmModal: confirmModalMock,
+      Skeleton: ({ height }: { height?: number }) => (
+        <div data-height={height} data-testid="skeleton" />
+      ),
+      toast: {
+        error: toastErrorMock,
+        success: toastSuccessMock,
+      },
+    }),
+  ];
+  const merged: Record<string, unknown> = { ...actual };
+  for (const factory of factories) {
+    const part = (await factory(importOriginal)) as Record<string, unknown>;
+    for (const [key, value] of Object.entries(part)) if (value !== actual[key]) merged[key] = value;
+  }
+  return merged;
 });
-
-vi.mock('@lobehub/ui/base-ui', async (importOriginal) => ({
-  ...((await importOriginal()) as Record<string, unknown>),
-  ActionIcon: ({
-    onClick,
-    title,
-    disabled,
-  }: {
-    disabled?: boolean;
-    onClick?: (e: React.MouseEvent) => void;
-    title?: string;
-  }) => (
-    <button
-      aria-label={title}
-      data-testid={title ? 'calendar' : 'refresh'}
-      disabled={disabled}
-      type="button"
-      onClick={onClick}
-    />
-  ),
-  confirmModal: confirmModalMock,
-  Skeleton: ({ height }: { height?: number }) => (
-    <div data-height={height} data-testid="skeleton" />
-  ),
-  toast: {
-    error: toastErrorMock,
-    success: toastSuccessMock,
-  },
-}));
 
 const claudeSnapshot = (
   overrides: Partial<ElectronClientIpcModule.ClaudeCodeQuotaSnapshot> = {},
@@ -256,133 +219,142 @@ const liveSessionReading = (capturedAt: number) => ({
   utilization: 8,
 });
 
-const codexSnapshot = (
-  overrides: Partial<ElectronClientIpcModule.CodexQuotaSnapshot> = {},
-): ElectronClientIpcModule.CodexQuotaSnapshot => ({
-  error: null,
-  provider: 'codex',
-  rateLimitResetCredits: null,
-  session: null,
-  status: 'ok',
-  updatedAt: Date.now(),
-  weekly: null,
-  ...overrides,
-});
+/** Persisted quota can render before the initial load finishes; focus is ignored while loading. */
+const waitForQuotaIdle = async () => {
+  await waitFor(() => expect(screen.getByTestId('refresh').hasAttribute('disabled')).toBe(false));
+  // Let the focus listener's effect observe loading=false before dispatching focus.
+  await act(async () => {
+    await Promise.resolve();
+  });
+};
 
 beforeEach(() => {
-  effectiveAgencyConfig.current = {
-    boundDeviceId: 'personal-device',
-    executionTarget: 'local',
-    heterogeneousProvider: { command: 'codex', type: 'codex' },
-  };
-  effectiveAgencyConfig.workspaceScoped = false;
   confirmModalMock.mockReset();
   mockService.consumeCodexRateLimitResetCredit.mockReset();
   mockService.getClaudeCodeQuota.mockReset();
   mockService.getCodexQuota.mockReset();
+  mockService.getKimiCodeQuota.mockReset();
   mockLambdaClaudeQuota.mockReset();
   mockLambdaCodexQuota.mockReset();
+  mockLambdaKimiCodeQuota.mockReset();
   mockQuotaService.refreshCodexQuota.mockImplementation(mockLambdaCodexQuota);
+  mockQuotaService.refreshKimiCodeQuota.mockImplementation(mockLambdaKimiCodeQuota);
   toastErrorMock.mockReset();
   toastSuccessMock.mockReset();
   mockQuotaService.getLatestReadings.mockResolvedValue([]);
   mockQuotaService.ingestClaudeSnapshot.mockClear();
+  mockQuotaService.ingestKimiCodeSnapshot.mockClear();
   mockQuotaService.listAccounts.mockResolvedValue([]);
   mockQuotaService.listBindings.mockResolvedValue([]);
+  vi.mocked(openQuotaCalendarModal).mockClear();
 });
 
-describe('HeteroControlBar', () => {
-  it('shows local Codex quota for a workspace member local-device override', async () => {
-    mockService.getCodexQuota.mockResolvedValue(
-      codexSnapshot({ session: { resetsAt: null, usedPercent: 20, windowMinutes: 300 } }),
+describe('KimiCodeQuotaMenu', () => {
+  it('renders all four windows and the Extra Usage footer from the snapshot', async () => {
+    mockService.getKimiCodeQuota.mockResolvedValue(
+      kimiCodeSnapshot({
+        extraUsage: {
+          balanceCents: 1234,
+          currency: 'USD',
+          monthlyChargeLimitCents: 5000,
+          monthlyChargeLimitEnabled: true,
+          monthlyUsedCents: 42,
+          totalCents: 2000,
+        },
+        monthly: { resetsAt: null, usedPercent: 55, windowMinutes: 43_200 },
+        monthlyCode: { resetsAt: null, usedPercent: 61, windowMinutes: 43_200 },
+        session: { resetsAt: null, usedPercent: 8, windowMinutes: 300 },
+        weekly: { resetsAt: null, usedPercent: 13, windowMinutes: 10_080 },
+      }),
     );
 
-    render(<HeteroControlBar />);
+    render(<KimiCodeQuotaMenu />);
 
+    expect(await screen.findByText('heteroAgent.kimiCodeQuota.fiveHour')).toBeTruthy();
+    expect(screen.getByText('heteroAgent.quota.weekly')).toBeTruthy();
+    expect(screen.getByText('heteroAgent.kimiCodeQuota.monthly')).toBeTruthy();
+    expect(screen.getByText('heteroAgent.kimiCodeQuota.monthlyCode')).toBeTruthy();
+    expect(screen.getByText('92%')).toBeTruthy();
+    expect(screen.getByText('39%')).toBeTruthy();
+    expect(screen.getByText('heteroAgent.kimiCodeQuota.extraUsage')).toBeTruthy();
     expect(
-      await screen.findByRole('button', { name: 'heteroAgent.codexQuota.tooltip' }),
+      screen.getByText((content) => content.startsWith('heteroAgent.kimiCodeQuota.monthlyCap:')),
     ).toBeTruthy();
-    expect(screen.queryByTestId('api-credits')).toBeNull();
-    expect(mockService.getCodexQuota).toHaveBeenCalledWith({ command: 'codex', env: undefined });
+    // The trigger compacts every window into the tightest remaining value.
+    const trigger = screen.getByRole('button', { name: 'heteroAgent.kimiCodeQuota.tooltip' });
+    expect(trigger.textContent).toContain('heteroAgent.quota.compactLeft:39');
+    expect(mockService.getKimiCodeQuota).toHaveBeenCalledWith({ env: undefined });
   });
 
-  it('shows Codex quota sampled by a bound remote device', async () => {
-    effectiveAgencyConfig.current = {
-      boundDeviceId: 'remote-device',
-      executionTarget: 'device',
-      heterogeneousProvider: { command: 'codex', type: 'codex' },
-    };
-    mockLambdaCodexQuota.mockResolvedValue(
-      codexSnapshot({ session: { resetsAt: null, usedPercent: 20, windowMinutes: 300 } }),
+  it('omits the monthly cap line when the charge limit is disabled', async () => {
+    mockService.getKimiCodeQuota.mockResolvedValue(
+      kimiCodeSnapshot({
+        extraUsage: {
+          balanceCents: 1234,
+          currency: 'USD',
+          monthlyChargeLimitCents: 0,
+          monthlyChargeLimitEnabled: false,
+          monthlyUsedCents: 42,
+          totalCents: 2000,
+        },
+        session: { resetsAt: null, usedPercent: 8, windowMinutes: 300 },
+      }),
     );
 
-    render(<HeteroControlBar />);
+    render(<KimiCodeQuotaMenu />);
 
+    expect(await screen.findByText('heteroAgent.kimiCodeQuota.extraUsage')).toBeTruthy();
     expect(
-      await screen.findByRole('button', { name: 'heteroAgent.codexQuota.tooltip' }),
-    ).toBeTruthy();
-    expect(mockLambdaCodexQuota).toHaveBeenCalledWith({
-      command: 'codex',
-      deviceId: 'remote-device',
-      env: undefined,
+      screen.queryByText((content) => content.startsWith('heteroAgent.kimiCodeQuota.monthlyCap')),
+    ).toBeNull();
+  });
+
+  it('maps unavailable reasons to their localized explanations', async () => {
+    mockService.getKimiCodeQuota.mockResolvedValue(
+      kimiCodeSnapshot({ reason: 'credentials-not-found', status: 'unavailable' }),
+    );
+
+    render(<KimiCodeQuotaMenu />);
+
+    expect(await screen.findByText('heteroAgent.kimiCodeQuota.unavailableNotFound')).toBeTruthy();
+  });
+
+  it('opens the usage calendar for the kimi-code account from the header switcher', async () => {
+    mockService.getKimiCodeQuota.mockResolvedValue(
+      kimiCodeSnapshot({
+        identity: { displayName: 'Kimi User', externalAccountId: 'kimi-ext-1' },
+        session: { resetsAt: null, usedPercent: 20, windowMinutes: 300 },
+      }),
+    );
+
+    render(<KimiCodeQuotaMenu />);
+
+    fireEvent.click(await screen.findByTestId('calendar'));
+
+    expect(openQuotaCalendarModal).toHaveBeenCalledWith({
+      externalAccountId: 'kimi-ext-1',
+      provider: 'kimi-code',
     });
-    expect(mockService.getCodexQuota).not.toHaveBeenCalled();
-  });
-
-  it('shows remote quota for a workspace shared-device fallback', async () => {
-    effectiveAgencyConfig.current = {
-      boundDeviceId: 'workspace-device',
-      executionTarget: 'local',
-      heterogeneousProvider: { command: 'codex', type: 'codex' },
-    };
-    effectiveAgencyConfig.workspaceScoped = true;
-    mockLambdaCodexQuota.mockResolvedValue(
-      codexSnapshot({ session: { resetsAt: null, usedPercent: 20, windowMinutes: 300 } }),
-    );
-
-    render(<HeteroControlBar />);
-
-    expect(
-      await screen.findByRole('button', { name: 'heteroAgent.codexQuota.tooltip' }),
-    ).toBeTruthy();
-    expect(mockLambdaCodexQuota).toHaveBeenCalledWith({
-      command: 'codex',
-      deviceId: 'workspace-device',
-      env: undefined,
-    });
-    expect(mockService.getCodexQuota).not.toHaveBeenCalled();
-  });
-
-  it('shows platform credits instead of Codex quota in API mode', () => {
-    effectiveAgencyConfig.current = {
-      boundDeviceId: 'personal-device',
-      executionTarget: 'local',
-      heterogeneousProvider: { authMode: 'api', command: 'codex', type: 'codex' },
-    };
-
-    render(<HeteroControlBar />);
-
-    expect(screen.getByTestId('api-credits')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'heteroAgent.codexQuota.tooltip' })).toBeNull();
-    expect(mockService.getCodexQuota).not.toHaveBeenCalled();
-  });
-
-  it('shows platform credits instead of Claude Code quota in API mode', () => {
-    effectiveAgencyConfig.current = {
-      boundDeviceId: 'personal-device',
-      executionTarget: 'local',
-      heterogeneousProvider: { authMode: 'api', type: 'claude-code' },
-    };
-
-    render(<HeteroControlBar />);
-
-    expect(screen.getByTestId('api-credits')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'heteroAgent.claudeQuota.tooltip' })).toBeNull();
-    expect(mockService.getClaudeCodeQuota).not.toHaveBeenCalled();
   });
 });
 
 describe('ClaudeCodeQuotaMenu', () => {
+  it('opens the usage calendar for the claude-code account from the header switcher', async () => {
+    mockQuotaService.listAccounts.mockResolvedValue([persistedAccount(Date.now() - 60_000)]);
+    mockQuotaService.getLatestReadings.mockResolvedValue([
+      persistedSessionReading(Date.now() - 60_000),
+    ]);
+
+    render(<ClaudeCodeQuotaMenu />);
+
+    fireEvent.click(await screen.findByTestId('calendar'));
+
+    expect(openQuotaCalendarModal).toHaveBeenCalledWith({
+      externalAccountId: 'ext-1',
+      provider: 'claude-code',
+    });
+  });
+
   it('renders session, weekly, and model-scoped windows from the snapshot', async () => {
     mockService.getClaudeCodeQuota.mockResolvedValue(
       claudeSnapshot({
@@ -472,6 +444,37 @@ describe('ClaudeCodeQuotaMenu', () => {
 
     expect(await screen.findByText('heteroAgent.claudeQuota.unavailableExternalAuth')).toBeTruthy();
     expect(screen.queryByText('raw main-process message')).toBeNull();
+  });
+
+  it('explains a network-blocked sample instead of reporting an expired login', async () => {
+    mockService.getClaudeCodeQuota.mockResolvedValue(
+      claudeSnapshot({ error: 'blocked (403)', reason: 'request-blocked', status: 'unavailable' }),
+    );
+
+    render(<ClaudeCodeQuotaMenu />);
+
+    expect(
+      await screen.findByText('heteroAgent.claudeQuota.unavailableRequestBlocked'),
+    ).toBeTruthy();
+    expect(screen.queryByText('heteroAgent.claudeQuota.unavailableExpired')).toBeNull();
+  });
+
+  it('keeps the unavailable explanation on screen while a retry is in flight', async () => {
+    mockService.getClaudeCodeQuota.mockResolvedValueOnce(
+      claudeSnapshot({ error: 'expired', reason: 'credentials-expired', status: 'unavailable' }),
+    );
+
+    render(<ClaudeCodeQuotaMenu />);
+
+    expect(await screen.findByText('heteroAgent.claudeQuota.unavailableExpired')).toBeTruthy();
+
+    mockService.getClaudeCodeQuota.mockImplementation(() => new Promise(() => {}));
+    fireEvent.click(screen.getByTestId('refresh'));
+
+    await waitFor(() => expect(mockService.getClaudeCodeQuota).toHaveBeenCalledTimes(2));
+    expect((screen.getByTestId('refresh') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByTestId('skeleton')).toBeNull();
+    expect(screen.getByText('heteroAgent.claudeQuota.unavailableExpired')).toBeTruthy();
   });
 
   it('shows a friendly rate-limit message for first-load 429 errors', async () => {
@@ -791,6 +794,23 @@ describe('ClaudeCodeQuotaMenu', () => {
     );
   });
 
+  it('explains a blocked live refresh under the persisted windows it could not update', async () => {
+    mockQuotaService.listAccounts.mockResolvedValue([persistedAccount(Date.now() - 31 * 60_000)]);
+    mockQuotaService.getLatestReadings.mockResolvedValue([
+      persistedSessionReading(Date.now() - 31 * 60_000),
+    ]);
+    mockService.getClaudeCodeQuota.mockResolvedValue(
+      claudeSnapshot({ error: 'blocked (403)', reason: 'request-blocked', status: 'unavailable' }),
+    );
+
+    render(<ClaudeCodeQuotaMenu />);
+
+    expect(
+      await screen.findByText('heteroAgent.claudeQuota.unavailableRequestBlocked'),
+    ).toBeTruthy();
+    expect(screen.getByText('92%')).toBeTruthy();
+  });
+
   it('paints persisted windows while a stale live refresh is still in flight', async () => {
     mockQuotaService.listAccounts.mockResolvedValue([persistedAccount(Date.now() - 31 * 60_000)]);
     mockQuotaService.getLatestReadings.mockResolvedValue([
@@ -831,6 +851,7 @@ describe('ClaudeCodeQuotaMenu', () => {
 
     // Fresh persisted data: nothing hits the live API on mount…
     expect(await screen.findByText('92%')).toBeTruthy();
+    await waitForQuotaIdle();
     expect(mockService.getClaudeCodeQuota).not.toHaveBeenCalled();
 
     // …but regaining focus revalidates (the main-process cache rate-limits it).
@@ -933,6 +954,7 @@ describe('ClaudeCodeQuotaMenu', () => {
     render(<ClaudeCodeQuotaMenu />);
 
     expect(await screen.findByText('92%')).toBeTruthy();
+    await waitForQuotaIdle();
 
     await act(async () => {
       window.dispatchEvent(new Event('focus'));
@@ -954,6 +976,7 @@ describe('ClaudeCodeQuotaMenu', () => {
     render(<ClaudeCodeQuotaMenu />);
 
     expect(await screen.findByText('92%')).toBeTruthy();
+    await waitForQuotaIdle();
 
     await act(async () => {
       window.dispatchEvent(new Event('focus'));
@@ -976,6 +999,7 @@ describe('ClaudeCodeQuotaMenu', () => {
     render(<ClaudeCodeQuotaMenu />);
 
     expect(await screen.findByText('92%')).toBeTruthy();
+    await waitForQuotaIdle();
 
     await act(async () => {
       window.dispatchEvent(new Event('focus'));
@@ -986,6 +1010,24 @@ describe('ClaudeCodeQuotaMenu', () => {
 });
 
 describe('CodexQuotaMenu', () => {
+  it('opens the usage calendar for the codex account from the header switcher', async () => {
+    mockService.getCodexQuota.mockResolvedValue(
+      codexSnapshot({
+        identity: { displayName: 'Codex User', externalAccountId: 'codex-ext-1' },
+        session: { resetsAt: null, usedPercent: 19, windowMinutes: 300 },
+      }),
+    );
+
+    render(<CodexQuotaMenu command="codex" />);
+
+    fireEvent.click(await screen.findByTestId('calendar'));
+
+    expect(openQuotaCalendarModal).toHaveBeenCalledWith({
+      externalAccountId: 'codex-ext-1',
+      provider: 'codex',
+    });
+  });
+
   it.each([
     [
       'failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)',

@@ -1,6 +1,5 @@
 import { getBuiltinRender } from '@lobechat/builtin-tools/renders';
-import { Flexbox } from '@lobehub/ui';
-import { Accordion, Skeleton } from '@lobehub/ui/base-ui';
+import { Accordion, Flexbox, Skeleton } from '@lobehub/ui';
 import { type CSSProperties } from 'react';
 import { memo, useState } from 'react';
 
@@ -115,6 +114,9 @@ const Tool = memo<InspectorProps>(
                   result={result}
                   showCustomToolRender={showCustomToolRender}
                   toolCallId={toolCallId}
+                  // Without this the render has no row to fetch a projected
+                  // body back from, and the expanded card stays empty.
+                  toolMessageId={toolMessage?.id}
                   type={type}
                 />
               </Flexbox>
@@ -124,6 +126,7 @@ const Tool = memo<InspectorProps>(
               <Inspectors
                 apiName={apiName}
                 identifier={identifier}
+                messageId={messageId}
                 result={result}
                 toolCallId={toolCallId}
               />
